@@ -1,0 +1,405 @@
+# Format checks enforced on CI:
+# 1. Comments must appear above each field.
+# 2. There must be a blank line between each field.
+# 3. Inline comments (after a field on the same line) are not allowed.
+# 4. Indentation level is respected for nested fields.
+
+# specify the default per-component configs
+defaults:
+
+  # <folder_name>@<field_name>.<field_name>: <yaml_file_name>
+  # actor_rollout_ref.actor: trainer/config/actor/dp_actor.yaml
+  - actor@actor_rollout_ref.actor: dp_actor
+
+  # data: trainer/config/data/legacy_data.yaml
+  - data@data: legacy_data
+
+  # Reference model config.
+  # Reference model will be enabled when actor.use_kl_loss or/and algorithm.use_kl_in_reward is/are True.
+  - ref@actor_rollout_ref.ref: dp_ref
+
+  # Rollout model config.
+  - rollout@actor_rollout_ref.rollout: rollout
+
+  # Model config.
+  - model@actor_rollout_ref.model: hf_model
+
+  # Critic model config.
+  - critic@critic: dp_critic
+
+  # Reward model config.
+  - reward_model@reward_model: dp_reward_model
+
+  # load the reference default config, then apply the fields in the current yaml
+  # self config override anything above
+  - _self_
+
+# config for actor, rollout and reference model
+actor_rollout_ref:
+
+  # Whether it's a hybrid engine, currently only supports hybrid engine
+  hybrid_engine: true
+
+  # Timeout for operations executed against the process group
+  nccl_timeout: 600
+
+  # Rollout model config.
+  rollout:
+
+    # for huge model, layered summon can save memory (prevent OOM) but make it slower
+    layered_summon: False
+
+# custom reward function definition
+custom_reward_function:
+
+  # The path to the file containing your customized reward function.
+  # If not specified, pre-implemented reward functions will be used.
+  path: null
+
+  # The name of the reward function within the specified file. Default is 'compute_score'.
+  name: compute_score
+
+# config for the algorithm
+algorithm:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.trainer.config.AlgoConfig
+
+  # Discount factor for future rewards
+  gamma: 1.0
+
+  # Trade-off between bias and variance in the GAE estimator
+  lam: 1.0
+
+  # Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
+  adv_estimator: gae
+
+  # Whether to normalize advantages by std (specific to GRPO)
+  norm_adv_by_std_in_grpo: True
+
+  # Whether to enable in-reward KL penalty
+  use_kl_in_reward: False
+
+  # How to estimate KL divergence: "kl", "abs", "mse", "low_var_kl", or "full"
+  kl_penalty: kl
+
+  # KL control configuration
+  kl_ctrl:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.trainer.config.KLControlConfig
+
+    # KL control type: "fixed" or "adaptive"
+    type: fixed
+
+    # Initial coefficient for KL penalty
+    kl_coef: 0.001
+
+    # Horizon value for adaptive controller (if enabled)
+    horizon: 10000
+
+    # Target KL divergence (used for adaptive controller)
+    target_kl: 0.1
+
+  # Whether to enable preference feedback PPO
+  use_pf_ppo: False
+
+  # Preference feedback PPO settings
+  pf_ppo:
+
+    # Method for reweighting samples: "pow", "max_min", or "max_random"
+    reweight_method: pow
+
+    # Power used for weight scaling in "pow" method
+    weight_pow: 2.0
+
+  # reward for correct_answer and wrong_answer
+  reward_correct: 1.0
+  reward_wrong: -1.0
+  
+  # customed advantage for special cases: 'all responses are correct' or 'all responses are wrong'
+  enable_customed_adv_for_all_correct: False
+  adv_all_correct: 1.0
+  enable_customed_adv_for_all_wrong: False
+  adv_all_wrong: -1.0
+
+  # Process-to-Token (P2T) reward. Active when algorithm.adv_estimator=p2t
+  p2t:
+
+    # path to the Process Reward Model
+    prm_path: /gpfs/pretrain-models/PRM/Gen-Verse/ReasonFlux-PRM-7B
+
+    # step separator token consumed by the PRM
+    sep: "<extra_0>"
+
+    # skip responses whose PRM input exceeds this many tokens (0 = no cap)
+    max_len: 0
+
+    # where the PRM rests between scoring calls. The worker is colocated with the
+    # training workers, so "none" would keep ~15GB pinned on every card and starve
+    # the rollout engine's KV cache.
+    # options: cpu | none
+    offload: cpu
+
+    # recompute activations during the attribution backward. Only needed for very
+    # long inputs; with backward_mode=per_step it costs one extra forward per step.
+    grad_checkpointing: False
+
+    # attention kernel for the PRM forward/backward. eager builds the full O(L^2)
+    # matrix (~73GB at 3k tokens, OOM at 8k); sdpa/flash are O(L) with
+    # bf16-identical logits. sdpa is zero-dependency; flash_attention_2 needs the
+    # flash-attn package (installed here) and is marginally faster on long inputs.
+    # options: sdpa | flash_attention_2 | eager
+    attn_implementation: sdpa
+
+    # scalar that is differentiated to get the token influence I_i.
+    # prob/logprob both saturate when the PRM score approaches 1 (measured median
+    # R_s = 0.9995), which flattens softmax(I) to uniform; logit_diff has no
+    # saturation gate and is the only one with real signal.
+    # options: prob | logprob | logit_diff
+    attribution_target: logit_diff
+
+    # single:   one backward on the sum, O(1) but early tokens mix in later steps
+    # per_step: one backward per step, each token uses only its own step reward;
+    #           ~S x slower on long (2k+8k) sequences, so single is the default.
+    # options: single | per_step
+    backward_mode: single
+
+    # softmax temperature over I_i within a step
+    temperature: 1.0
+
+    # map the raw PRM step reward R_s (a probability in [0,1]) before it is broadcast
+    # (process) and redistributed (p2t). "signed" (2*R_s-1) lets a bad step carry
+    # negative reward, which removes the strictly-positive per-token bias that drives
+    # length/step hacking. options: null ([0,1]) | signed ([-1,1])
+    process_reward_scale: "null"
+
+    # advantage = weighted sum of three independently toggled terms:
+    #   A = use_outcome*outcome_coef*A_outcome
+    #     + use_p2t*p2t_coef*R_p2t             (R_p2t = R_s*softmax(I), redistribution)
+    #     + use_process*process_coef*R_process (R_process = R_s, flat baseline)
+    # The p2t token reward is pure redistribution (R_s*softmax(I), sums to R_s per
+    # step); the flat baseline comes from the process term. Paper Eq.5 (alpha=1,
+    # omega=0.6) == outcome(group-mean-std, coef=1) + p2t(coef=0.6) + process(coef=1).
+
+    # outcome term: group-relative advantage from the answer correctness reward
+    use_outcome_adv: True
+    outcome_adv_coef: 1.0
+    # null: raw reward as adv | group-mean: subtract group mean (Dr.GRPO)
+    #   | group-mean-std: subtract mean, divide by std (GRPO)
+    outcome_adv_norm_mode: group-mean-std
+
+    # p2t term: within-step redistribution of the PRM step reward (R_s*softmax(I))
+    use_p2t_adv: True
+    p2t_adv_coef: 0.6
+
+    # process term: raw per-step PRM reward broadcast to its tokens (the flat baseline)
+    use_process_adv: True
+    process_adv_coef: 1.0
+
+
+# config for the trainer
+trainer:
+
+  # Whether to balance batch sizes across distributed workers
+  balance_batch: True
+
+  # Number of epochs in training
+  total_epochs: 30
+
+  # Total training steps (can be set explicitly or derived from epochs)
+  total_training_steps: null
+
+  # Project name for experiment tracking (e.g., wandb)
+  project_name: verl_examples
+
+  # Experiment name for run identification in tracking tools
+  experiment_name: gsm8k
+
+  # Logging backends to use: "console", "wandb", etc.
+  logger: ["console", "wandb"]
+
+  # Number of generations to log during validation
+  log_val_generations: 0
+
+  # Directory for logging rollout data; no dump if null
+  rollout_data_dir: null
+
+  # Directory for logging validation data; no dump if null
+  validation_data_dir: null
+
+  # 
+  save_per_data_info_to_parquet: True
+  log_dir: null
+
+
+  # Number of nodes used in the training
+  nnodes: 1
+
+  # Number of GPUs per node
+  n_gpus_per_node: 8
+  
+  # Save frequency (by iteration) for model checkpoints
+  save_freq: 50
+
+  # ESI refers to the elastic server instance used during training, similar to the training plan. For example,
+  # if you purchase 10 hours of computing power, the ESI will automatically shut down after 10 hours of training.
+  # To ensure a checkpoint is saved before ESI shuts down, the system will start saving a checkpoint in advance.
+  # The advance time is calculated as: Advance Time = Longest historical step duration + Checkpoint save duration + esi_redundant_time.
+  # Here, esi_redundant_time is a user-defined value that further extends the advance time for added safety.
+  esi_redundant_time: 0
+
+  # Resume mode: "auto", "disable", or "resume_path"
+  # "auto_from_step": resume from last checkpoint if available
+  # "auto_from_epoch": resume from last checkpoint of last epoch if available
+  # "disable": start from scratch
+  # "resume_path": resume from a user-defined path
+  resume_mode: auto_from_step     # (modified by wst)
+
+  # Path to resume training from (only used when resume_mode is "resume_path")
+  resume_from_path: null
+
+  # Whether disable load checkpoints for actor and critic
+  resume_actor_critic_disabled: False
+
+  # Whether the resumed ckpt is the last step in that epoch
+  resume_ckpt_is_last_step_in_that_epoch: False
+
+  # Whether to run validation before training begins
+  val_before_train: False
+
+  # Whether to run validation only
+  val_only: False
+
+  # Validation frequency (in training iterations)
+  test_freq: -1
+
+  # Number of iterations to warm up the critic before updating policy
+  critic_warmup: 0
+
+  # Default path to distributed filesystem for saving checkpoints
+  default_hdfs_dir: null
+
+  # Whether to delete local checkpoints after loadingvscode-remote://ssh-remote%2B10.1.1.7/data1/wusitong/RL_code/trpo/randroll
+  del_local_ckpt_after_load: False
+
+  # Default local directory for saving checkpoints
+  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+
+  # Maximum number of actor checkpoints to keep
+  max_actor_ckpt_to_keep: null
+
+  # Maximum number of critic checkpoints to keep
+  max_critic_ckpt_to_keep: null
+
+  # Timeout (in seconds) for Ray worker to wait for registration
+  ray_wait_register_center_timeout: 300
+
+  # Device to run training on (e.g., "cuda", "cpu")
+  device: cuda
+
+  # whether to use legacy worker implementation
+  #  mode: "auto", "enable", or "disable"
+  use_legacy_worker_impl: auto
+
+# profiler configs
+global_profiler:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.utils.profiler.ProfilerConfig
+
+  # Profiling tool: choose between nsys, npu, torch, torch_memory
+  tool: null
+
+  # profile steps
+  steps: null
+
+  # Whether to combine continuous steps into one database.
+  ## If True, worker.profiler.discrete must be False, [1,2] in one, [5] in another.
+  ## If False, [1] in one, [2] in another, [5] in another.
+  profile_continuous_steps: False
+
+  # Path to save profiling contents
+  save_path: "outputs/profile"
+
+  # Specific tool configs, can use +profiler.tool_config.[tool].xxx to config
+  global_tool_config:
+
+    # nsys config
+    nsys:
+
+      # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+      _target_: verl.utils.profiler.config.NsightToolConfig
+
+      # True for each task has its own database, False for all tasks in one training step share one database.
+      discrete: False
+
+      # controller Nvidia Nsight Systems Options. Must set when profile_steps is not None.
+      ## reference https://docs.nvidia.com/nsight-systems/UserGuide/index.html
+      ## reference https://docs.ray.io/en/latest/ray-observability/user-guides/profiling.html
+      controller_nsight_options:
+
+        # Select the API(s) to be traced.
+        trace: "cuda,nvtx,cublas,ucx"
+
+        # Track the GPU memory usage by CUDA kernels. Must be string type "true" or "false".
+        cuda-memory-usage: "true"
+
+        # CUDA graphs will be traced as a whole
+        cuda-graph-trace: "graph"
+
+      # worker Nvidia Nsight Systems Options. Must set when profile_steps is not None.
+      worker_nsight_options:
+
+        # Select the API(s) to be traced.
+        trace: "cuda,nvtx,cublas,ucx"
+
+        # Track the GPU memory usage by CUDA kernels. Must be string type "true" or "false".
+        cuda-memory-usage: "true"
+
+        # CUDA graphs will be traced as a whole
+        cuda-graph-trace: "graph"
+
+        # Profiling only in a range of torch.cuda.profiler.start and stop. Do not change this config.
+        capture-range: "cudaProfilerApi"
+
+        # Specify the desired behavior when a capture range ends.
+        # In verl we need the torch.cuda.profiler.start/stop pair to repeats n times.
+        # valid values are "repeat-shutdown:n" or null.
+        # For normal whole step profiling, n = len(profile_steps);
+        # but for discrete profiling, n = len(profile_steps) * Number(subtasks).
+        # Or you can just leave it null and the program will use n = len(profile_steps) * 6;
+        capture-range-end: null
+
+        # Send signal to the target application's process group. We let the program to exit by itself.
+        kill: none
+
+    # enable memory visualization for debugging memory usage
+    torch_memory:
+
+      #  Maximum number of allocation entries to record
+      trace_alloc_max_entries: 100_000
+
+      # The depth of the call stack to capture for each allocation
+      stack_depth: 32
+
+      # 'alloc': records only allocation events || 'state': records memory state changes || 'all': records both.
+      context: "all"
+
+      # 'python': records Python stacks || 'cpp': records C++ stacks (available in some versions) || 'all': records both.
+      stacks: "all"
+
+      # devices, record_context etc.
+      kw_args: {}
+
+# configs related to ray
+ray_kwargs:
+
+  # configs related to ray initialization
+  ray_init:
+
+    # Number of CPUs for Ray. Use a fixed number instead of null when using SLURM.
+    num_cpus: null
+
+  # Path to save Ray timeline JSON for performance profiling
+  timeline_json_file: null
