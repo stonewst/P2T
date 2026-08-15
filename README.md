@@ -33,7 +33,7 @@ influence to the inner product between
 - the gradient of the reward w.r.t. the token embedding (`∂R/∂e_i`).
 
 $$
-I_i \approx \big\langle\ e_i - e_{\text{null}},\ \tfrac{\partial R}{\partial e_i} \,\big\rangle
+I_i \approx \big\langle\ e_i - e_{\text{null}}, \tfrac{\partial R}{\partial e_i} \big\rangle
 $$
 
 This needs only a **single forward and backward pass**. The step reward `R_s` is then
