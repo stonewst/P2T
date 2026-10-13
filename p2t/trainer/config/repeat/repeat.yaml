@@ -1,0 +1,85 @@
+# Malignant-repeat detection configuration (top-level `repeat` key).
+#
+# The step-level interventions are configured under `algorithm` and require enable=True:
+#   algorithm.use_process_p2t_reward_calib -- overwrite R_s (and p2t_reward) from t1 onward
+#   algorithm.use_mask_after_t2            -- narrow that to [t1, t2) and drop [t2, end)
+#                                             from the loss
+#
+# To use omega_conf_to_dataclass on this section:
+_target_: p2t.trainer.config.RepeatConfig
+
+# ── Enable ────────────────────────────────────────────────────────────────────
+# Enable detection. On its own it only adds `repeat/*` metrics and dump columns.
+enable: True
+
+# Number of parallel Ray chunks. Detection runs asynchronously alongside the reward /
+# PRM / log-prob computation.
+num_workers: 8
+
+# Also record which levels would fire, independently of priority (the
+# repeat_det_hit_* dump columns). Slow (runs every level on every response);
+# diagnosis only. When false, hit_* records which level actually fired.
+collect_stage_hits: false
+
+# Skip the char-level fallback for texts longer than this (0 = no cap).
+char_max_chars: 0
+
+# ── Level 1: word-level block hashing ─────────────────────────────────────────
+# A repeat counts as malignant when a unit of >= min_period words recurs
+# >= min_repeats times, tolerating up to max_consecutive_mismatch mismatched words,
+# with the unit containing >= min_unique_tokens_in_unit distinct words (so a bare
+# "the the the" does not trigger).
+block_size: 12
+
+min_repeats: 3
+
+max_consecutive_mismatch: 3
+
+min_period: 2
+
+min_unique_tokens_in_unit: 2
+
+# ── Level 2: char-level fallback ──────────────────────────────────────────────
+# Catches repeats that do not align to word boundaries.
+char_fallback: true
+
+char_block_size: 50
+
+char_min_period: 15
+
+char_min_unique: 3
+
+# ── Level 3: \boxed{} spam ────────────────────────────────────────────────────
+# Fires when the response contains >= boxed_threshold `\boxed{}` occurrences and a
+# single value covers >= boxed_dominant_ratio of them. The repeat anchor is the
+# boxed_m_index-th occurrence, offset by boxed_tail_chars.
+boxed_fallback: true
+
+boxed_threshold: 5
+
+boxed_dominant_ratio: 0.75
+
+boxed_m_index: 4
+
+boxed_tail_chars: 0
+
+# ── Level 4: spam ─────────────────────────────────────────────────────────────
+# spam_word:   one word dominating the response -- needs >= spam_word_min_count
+#              occurrences, >= spam_word_min_ratio of all words, and a consecutive
+#              run of >= spam_word_min_run.
+# spam_concat: a short unit repeated with no separators, so word folding sees one
+#              giant word -- needs >= spam_concat_min_repeats copies of a unit whose
+#              length lies in [spam_concat_min_unit_len, spam_concat_max_unit_len].
+spam_fallback: true
+
+spam_word_min_count: 15
+
+spam_word_min_ratio: 0.35
+
+spam_word_min_run: 10
+
+spam_concat_min_repeats: 15
+
+spam_concat_min_unit_len: 3
+
+spam_concat_max_unit_len: 40

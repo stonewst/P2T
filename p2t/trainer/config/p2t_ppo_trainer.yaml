@@ -1,0 +1,317 @@
+# P2T Trainer Configuration
+# This configuration file inherits from ppo_trainer.yaml. It builds on the DAPO
+# dynamic-sampling machinery and adds process-reward (PRM) features on top:
+# 1. Dynamic sampling with group filtering (algorithm.dapo.dynamic_data_filter)
+# 2. Overlong buffer penalty for reward shaping (overlong_buffer)
+# 3. Process-reward inference via a PRM worker (algorithm.p2t.prm)
+
+# Format checks enforced on CI:
+# 1. Comments must appear above each field.
+# 2. There must be a blank line between each field.
+# 3. Inline comments (after a field on the same line) are not allowed.
+# 4. Indentation level is respected for nested fields.
+
+# Hydra configuration for file search paths
+hydra:
+
+  # Add search path to find base configuration files
+  searchpath:
+
+    # Search in p2t/trainer/config directory
+    - file://p2t/trainer/config
+
+# Specify default per-component configs
+defaults:
+
+  # Inherit all configurations from ppo_trainer.yaml
+  - ppo_trainer
+
+  # Override with current file's settings
+  - _self_
+
+# Data configuration (DAPO-specific enhancements)
+data:
+  
+  # With dynamic sampling, the number of prompts generated per round is derived each round:
+  #   gen_bsz_ratio  = (1 / valid_ratio) * gen_batch_size_factor
+  #   gen_batch_size = ceil(needed * gen_bsz_ratio / div) * div, capped by the remaining pool
+  # where `needed` is the number of prompts still missing and valid_ratio is the filter
+  # yield of the previous step (1.0 on the first step).
+
+  # gen_batch_size is rounded to a multiple of this (from the second round onwards).
+  gen_batch_size_div: 4
+
+  # Oversampling factor on top of (1 / valid_ratio).
+  # Raise it if force stops (pool exhausted mid-accumulation) happen too often.
+  gen_batch_size_factor: 1.5
+
+
+
+# Reward model configuration
+# reward_model:
+
+#   # Use DAPO reward manager instead of default
+#   reward_manager: naive
+
+  # Overlong buffer: penalize responses that are too long
+  # overlong_buffer:
+
+  #   # Whether to enable overlong buffer penalty
+  #   enable: False
+
+  #   # Buffer length in tokens (soft limit before max_response_length)
+  #   # Example: if max_response_length=20480 and len=4096,
+  #   # then expected_len=16384, and responses longer than this get penalized
+  #   len: 0
+
+  #   # Penalty factor (how much to penalize overlong outputs)
+  #   # Penalty increases linearly from 0 to this value as length exceeds expected_len
+  #   # Example: penalty_factor=1.0 means max penalty of -1.0 reward
+  #   penalty_factor: 0.0
+
+  #   # Whether to log overlong statistics
+  #   log: False
+
+# Algorithm configuration
+algorithm:
+
+  dapo:
+    dynamic_data_filter:
+      # Whether to enable DAPO dynamic sampling (filtering and resampling)
+      enable: False
+
+      # Per-response metric used for filtering; must be a key of non_tensor_batch set by
+      # the reward manager. Groups whose values are all 0.0 or all 1.0 are dropped, so use
+      # a 0/1 metric such as "acc".
+      metric: acc
+
+  # P2T configuration.
+  # p2t.prm.* is passed to the PRM worker (model, packing, attribution);
+  # p2t.* is read on the driver (token reward knobs, below).
+  p2t:
+    prm:
+      # Enable the PRM worker. When False, training uses the outcome reward only.
+      enable: True
+
+      # Path to the Process Reward Model (e.g. Qwen2.5-Math-PRM-7B).
+      prm_path: ""
+
+      # Step separator token the PRM scores at ("<extra_0>" for Qwen2.5-Math-PRM).
+      sep: "<extra_0>"
+
+      # Optional PRM system prompt; null uses the chat template's default.
+      system_prompt: null
+
+      # Skip responses whose PRM input exceeds this many tokens (0 = no cap).
+      max_len: 0
+
+      # Where the PRM rests between scoring calls: "cpu" or "none" (stay on GPU).
+      offload: cpu
+
+      # Attention implementation for the PRM: sdpa | flash_attention_2 | eager.
+      attn_implementation: flash_attention_2
+
+      # Class index treated as "correct" in the PRM's 2-way head.
+      positive_class: 1
+
+      # How to read the step reward R_s from the PRM's 2-class output:
+      #   - "prob_diff": p_pos - p_neg, in [-1, 1]
+      #   - "prob":      p_pos, in [0, 1]
+      reward_transform: prob_diff
+
+      # ---- packing: group short "\n\n" segments into PRM steps of controlled length ----
+
+      # Enable packing. When False, each "\n\n" segment is one PRM step.
+      use_pack_short_process: True
+
+      # Packing floor: a block shorter than this many policy tokens is penalised (> 0).
+      pack_min_token_per_process: 32
+
+      # Packing ceiling: a block longer than this is penalised.
+      pack_max_token_per_process: 128
+
+      # Partition solver: "dp" (exact optimum) or "greedy".
+      pack_algorithm: dp
+
+      # Weight of the ceiling penalty against the floor penalty in
+      # cost(L) = max(0, min-L)^2 + over * max(0, L-max)^2.
+      pack_over_penalty: 1.0
+
+      # ---- token attribution I_i (see prm/attribution.py) ----
+      # I_i = grad_{e_i}(S_s) . (e_i - e_pad): a first-order estimate of how much step s's
+      # PRM score changes if token i is replaced by padding.
+
+      # Enable attribution (one extra backward pass per response).
+      use_p2t_attribution: True
+
+      # Scalar S_s that is differentiated:
+      #   logit_diff: z_pos - z_neg        (no saturation)
+      #   logprob   : log_softmax(z)_pos   (gradient vanishes as p -> 1)
+      #   prob      : softmax(z)_pos       (gradient vanishes as p -> 1)
+      p2t_attribution_target: logit_diff
+
+      # single  : one backward on sum_s S_s (a token also receives gradient from later steps).
+      # per_step: one backward per step (exact, more expensive).
+      p2t_attribution_backward: single
+
+      # Use activation recomputation during the attribution pass (switches the PRM to
+      # train() mode; the PRM must not have active dropout).
+      p2t_attribution_grad_ckpt: True
+
+    # ---- P2T token reward: I_i -> R_i (see prm/p2t_reward.py) ----
+    # For a step s with reward R_s, N_s tokens and weights w_i (from |I_i|, summing to 1),
+    # with eta = p2t_residual_coef:
+    #   v0: R_i = N_s * R_s * w_i                         step total N_s * R_s
+    #   v1: R_i = R_s + eta * w_i * R_s                   step total N_s * R_s + eta * R_s
+    #   v2: R_i = R_s + eta * sign(I_i) * w_i * |R_s|
+    #   v3: as v2, with the weights normalized within each sign group
+    #   v4: as v2, with the two sign groups rescaled to a common total B (p2t_v4_balance),
+    #       so the step total is N_s * R_s
+    # v0 and v1 keep R_s's sign on every token; v2-v4 can flip signs for eta > 1.
+    p2t_reward_mode: v4
+
+    # v4 only. Common total B of the two sign groups:
+    #   min : B = min(P, M); no token exceeds its global share.
+    #   mean: B = (P + M) / 2; keeps the full residual mass, amplifies the minority group.
+    # A step whose tokens all push in one direction gets no residual.
+    p2t_v4_balance: min
+
+    # v1-v4 only. eta, the residual's strength (the paper's omega under v1). 0.0 reduces the
+    # reward to the flat process reward.
+    p2t_residual_coef: 1.0
+
+    # Weight family. power reads p2t_alpha, softmax reads p2t_temperature:
+    #   power   : w_i = |I_i|^alpha  / sum_j |I_j|^alpha   (invariant to the scale of I)
+    #   softmax : w_i = exp(|I_i|/T) / sum_j exp(|I_j|/T)
+    p2t_weighting: power
+
+    # power only. 0.0 gives uniform weights; larger values concentrate the reward on the
+    # highest-|I| tokens. With p2t_sharpness_target set it is the solver's upper bound;
+    # "auto" solves alpha per step with 1.0 as the bound.
+    p2t_alpha: 1.0
+
+    # null disables the solver. Otherwise a fraction in (0, 1]: per step, the shape
+    # parameter is chosen so that sharpness = exp(entropy(w)) / N_s stays at or above this
+    # value (largest alpha <= p2t_alpha under power, smallest T >= mean|I| under softmax).
+    p2t_sharpness_target: null
+
+    # softmax only. A positive T, or "auto" to solve T per step (requires
+    # p2t_sharpness_target). T must match the scale of |I| (see prm/p2t_influence_absmean);
+    # check prm/p2t_sharpness, where 1.0 means uniform weights.
+    p2t_temperature: 1.0
+
+    # Clip R_i into [-clip, clip]; 0 = off. The clipped amount is dropped (see
+    # prm/p2t_mass_err).
+    p2t_clip: 0.0
+
+    # Degeneracy threshold: a step with sum|I| <= epsilon uses uniform weights
+    # (counted in prm/p2t_uniform_ratio).
+    p2t_epsilon: 1.0e-6
+
+
+# ============================================================================
+# Usage Examples and Best Practices
+# ============================================================================
+
+# Example 1: Basic DAPO setup with dynamic sampling
+# --------------------------------------------------
+# data:
+#   train_batch_size: 16       # Target number of VALID prompts per training step
+#   gen_batch_size_factor: 1.5 # Oversample 1.5x on top of the filter yield
+#   gen_batch_size_div: 4      # Round the generation batch up to a multiple of this
+#
+# algorithm:
+#   dapo:
+#     dynamic_data_filter:
+#       enable: True
+#       metric: acc            # Filter on accuracy (see the note on `metric` above)
+#
+# Expected behavior:
+#   - Each training step needs 16 valid prompts
+#   - gen_batch_size is derived, not configured: (1 / valid_ratio) * gen_batch_size_factor
+#     * train_batch_size, rounded up to a multiple of gen_batch_size_div. valid_ratio is
+#     the previous step's filter yield (1.0 on the first step)
+#   - Filters out "all correct" or "all wrong" groups
+#   - If fewer than 16 prompts survive, generates another round and accumulates
+#   - There is NO cap on the number of rounds. The loop instead stops when the epoch's
+#     remaining sampling pool can no longer fill one generation batch -- that triggers a
+#     force stop, which DISCARDS the partially accumulated batch (drop_last) and skips
+#     the step without training. Accumulators are also reset at each epoch boundary.
+
+# Example 2: DAPO with overlong buffer (math reasoning tasks)
+# ------------------------------------------------------------
+# NOTE: the overlong_buffer block above is commented out; uncomment
+# reward_model.overlong_buffer before using this example.
+#
+# data:
+#   max_response_length: 20480  # 20K tokens hard limit
+#   train_batch_size: 512
+#   gen_batch_size_factor: 2.0  # Oversample more when the filter is expected to bite hard
+#
+# reward_model:
+#   overlong_buffer:
+#     enable: True
+#     len: 4096                 # 4K token soft buffer
+#     penalty_factor: 1.0       # Max penalty of -1.0
+#     log: True                 # Log overlong statistics
+#
+# Expected behavior:
+#   - Hard limit: 20K tokens (20480)
+#   - Soft limit: 16K tokens (20480 - 4096)
+#   - If response is 18K tokens: penalty = -(18000-16384)/4096 * 1.0 ≈ -0.39
+#   - If response is 20K tokens: penalty = -(20480-16384)/4096 * 1.0 = -1.0
+
+# Example 3: High-throughput DAPO (low filtering rate)
+# -----------------------------------------------------
+# data:
+#   train_batch_size: 32
+#   gen_batch_size_factor: 1.2  # Small safety margin (few groups expected to be filtered)
+#
+# algorithm:
+#   dapo:
+#     dynamic_data_filter:
+#       enable: True
+#       metric: acc
+#
+# Expected behavior:
+#   - Low filtering rate → valid_ratio stays near 1 → small generation batches
+#   - Faster training with less wasted computation
+
+# Example 4: Aggressive DAPO (high filtering rate)
+# -------------------------------------------------
+# data:
+#   train_batch_size: 16
+#   gen_batch_size_factor: 2.0  # Large safety margin on top of the filter yield
+#
+# algorithm:
+#   dapo:
+#     dynamic_data_filter:
+#       enable: True
+#       metric: acc
+#
+# Expected behavior:
+#   - High filtering rate → valid_ratio drops → (1 / valid_ratio) inflates the generation
+#     batch automatically, so a low yield is absorbed by the controller rather than by a
+#     hand-tuned gen_batch_size
+#   - More rounds per step, and a higher chance of exhausting the epoch's pool (force stop)
+
+# ============================================================================
+# Notes:
+# ============================================================================
+# 1. The DynamicBatchSampler will automatically adjust batch sizes during
+#    training based on filtering rates and remaining sample needs.
+#
+# 2. Checkpoint/resume is fully supported - the sampler persists both the indices
+#    already sampled in the current epoch and the supplementary pool of excess
+#    valid prompts handed back by the filter.
+#
+# 3. gen_batch_size is NOT a config knob here; it is derived each step from
+#    valid_ratio, gen_batch_size_factor and gen_batch_size_div. Tune the
+#    factor, and watch the dapo/ratio_* metrics for the observed filtering rate.
+#
+# 4. The overlong_buffer penalty is applied before computing advantages,
+#    so it affects both the policy gradient and value function training.
+#
+# 5. Running out of sampleable data does NOT raise. The step is force-stopped, its
+#    partially accumulated batch is discarded (drop_last) and training moves on to
+#    the next epoch. Raise gen_batch_size_factor if this happens too often.

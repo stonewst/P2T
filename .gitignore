@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+venv/
+.env
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+.claude/
+
+# Training outputs
+workdir_train/
+outputs/
+checkpoints/
+wandb/
+tensorboard_log/
+*.log
+
+# Model weights
+*.safetensors
+*.bin
+*.pt
+*.pth
