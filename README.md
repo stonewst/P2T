@@ -9,7 +9,7 @@ Sitong Wu<sup>1</sup>, Haoru Tan<sup>3&dagger;</sup>, Bin Xia<sup>1</sup>, Xiche
 <sup>1</sup>Chinese University of Hong Kong &nbsp;&nbsp; <sup>2</sup>Hong Kong University of Science and Technology &nbsp;, <sup>3</sup>University of Hong Kong
 
 
-[![Paper](https://img.shields.io/badge/Paper-CVPR_2026-blue)](https://openaccess.thecvf.com/content/CVPR2026/html/Wu_Unlocking_Token_Rewards_via_Training-Free_Reward_Attribution_CVPR_2026_paper.html)
+[![Paper](https://img.shields.io/badge/Paper-CVPR_2026-blue)](https://arxiv.org/abs/2610.18704)
 [![Code](https://img.shields.io/badge/GitHub-P2T-black?logo=github)](https://github.com/stonewst/P2T)
 [![Built on verl](https://img.shields.io/badge/built%20on-verl-orange)](https://github.com/volcengine/verl)
 
